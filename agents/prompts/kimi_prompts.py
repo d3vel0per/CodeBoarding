@@ -62,6 +62,7 @@ Reason carefully, then execute:
      * What is its main flow/purpose
      * WHY these specific clusters are grouped together (provide clear rationale for the grouping decision)
      * How this group interacts with other cluster groups (which groups it calls, receives data from, or depends on)
+     * The most important classes/methods in this group — mention their exact qualified names as shown in the clusters above
 
 Focus on creating cohesive, logical groupings that reflect the actual {project_type} architecture based on semantic meaning from method names, call patterns, and architectural context. Describe inter-group interactions based on the inter-cluster connections.
 
@@ -303,6 +304,7 @@ Reason carefully, then execute:
      * What is its main flow/purpose
      * WHY these specific clusters are grouped together (provide clear rationale)
      * How this group interacts with other cluster groups
+     * The most important classes/methods in this group — mention their exact qualified names as shown in the clusters above
 
 Focus on core subsystem functionality only. Avoid cross-cutting concerns like logging or error handling.
 
@@ -349,6 +351,37 @@ Constraints:
 - Sub-components should translate well to flow diagram representation
 
 Justify component choices based on fundamental architectural importance."""
+
+
+PATCH_SYSTEM_MESSAGE = """\
+You are a precise JSON patch generator for software architecture diagrams.
+
+Given an EASE-encoded sub-analysis and an impact dossier describing what
+changed, produce RFC 6902 JSON Patch operations to update the sub-analysis.
+
+EASE encoding: arrays are stored as dicts with two-character keys (aa, ab, ...)
+and a display_order list. Use the two-character keys in your patch paths.
+
+Rules:
+- Only patch what actually changed. Untouched siblings must remain as-is.
+- Use "replace" for updating existing values.
+- Use "add" for new entries (append to display_order too).
+- Use "remove" for deleted entries (remove from display_order too).
+- Paths use JSON Pointer syntax: /components/aa/description
+"""
+
+
+TRACE_SYSTEM_MESSAGE = """\
+You are a semantic impact analyzer for software architecture diagrams.
+
+Given changed methods and their call-graph neighbors, determine which methods
+have their *semantic role or behavior* materially affected by the changes.
+A method is impacted if its description in an architecture diagram would need
+updating — not just because it calls or is called by a changed method.
+
+You control traversal: request additional method bodies to inspect by name.
+Stay within the budget. When you have enough information, stop.
+"""
 
 
 class KimiPromptFactory(AbstractPromptFactory):
@@ -398,3 +431,9 @@ class KimiPromptFactory(AbstractPromptFactory):
 
     def get_details_message(self) -> str:
         return DETAILS_MESSAGE
+
+    def get_patch_system_message(self) -> str:
+        return PATCH_SYSTEM_MESSAGE
+
+    def get_trace_system_message(self) -> str:
+        return TRACE_SYSTEM_MESSAGE

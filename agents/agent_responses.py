@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import abc
 import logging
 from abc import abstractmethod
+from pathlib import PurePosixPath
 from typing import get_origin, Optional
 
 from pydantic import BaseModel, Field
@@ -20,6 +23,8 @@ class LLMBaseModel(BaseModel, abc.ABC):
         # Here iterate over the fields that we have and use their description like:
         result_str = "please extract the following: "
         for fname, fvalue in cls.model_fields.items():
+            if getattr(fvalue, "exclude", False):
+                continue
             # check if the field type is Optional
             ftype = fvalue.annotation
             # Check if the type is a typing.List (e.g., typing.List[SomeType])
@@ -107,7 +112,7 @@ class ClustersComponent(LLMBaseModel):
         description="List of cluster IDs from the CFG analysis that are grouped together (e.g., [1, 3, 5])"
     )
     description: str = Field(
-        description="Explanation of what this component does, its main flow, WHY these clusters are grouped together, and how it interacts with other cluster groups"
+        description="Explanation of what this component does, its main flow, WHY these clusters are grouped together, how it interacts with other cluster groups, and the most important classes/methods (by their exact qualified names from the clusters)"
     )
 
     def llm_str(self):
@@ -146,6 +151,25 @@ class MethodEntry(BaseModel):
             return NotImplemented
         return self.qualified_name == other.qualified_name
 
+    @classmethod
+    def from_method_change(cls, method_change) -> MethodEntry:
+        return cls(
+            qualified_name=method_change.qualified_name,
+            start_line=method_change.start_line,
+            end_line=method_change.end_line,
+            node_type=method_change.node_type,
+        )
+
+    @classmethod
+    def from_node(cls, node) -> MethodEntry:
+        """Build from a ``static_analyzer.Node``. Accepts ``Any`` to avoid a hard dep."""
+        return cls(
+            qualified_name=node.fully_qualified_name,
+            start_line=node.line_start,
+            end_line=node.line_end,
+            node_type=node.type.name,
+        )
+
 
 class FileMethodGroup(BaseModel):
     """All methods/functions belonging to a component within a single file."""
@@ -154,6 +178,15 @@ class FileMethodGroup(BaseModel):
     methods: list[MethodEntry] = Field(
         default_factory=list,
         description="Methods and functions in this file that belong to the component, sorted by start_line.",
+    )
+
+
+class FileEntry(BaseModel):
+    """Single source of truth for methods in one file."""
+
+    methods: list[MethodEntry] = Field(
+        default_factory=list,
+        description="Methods and functions in this file, sorted by start line.",
     )
 
 
@@ -210,6 +243,11 @@ class AnalysisInsights(LLMBaseModel):
     description: str = Field(
         description="One paragraph explaining the functionality which is represented by this graph. What the main flow is and what is its purpose."
     )
+    files: dict[str, FileEntry] = Field(
+        default_factory=dict,
+        description="Top-level file index keyed by relative file path. Contains all methods and statuses.",
+        exclude=True,
+    )
     components: list[Component] = Field(description="List of the components identified in the project.")
     components_relations: list[Relation] = Field(description="List of relations among the components.")
 
@@ -220,6 +258,10 @@ class AnalysisInsights(LLMBaseModel):
         body = "\n".join(ac.llm_str() for ac in self.components)
         relations = "\n".join(cr.llm_str() for cr in self.components_relations)
         return title + body + relations
+
+    def file_to_component(self) -> dict[str, str]:
+        """Build file path -> component_id mapping from root components."""
+        return {str(PurePosixPath(fg.file_path)): c.component_id for c in self.components for fg in c.file_methods}
 
 
 def assign_component_ids(analysis: AnalysisInsights, parent_id: str = "") -> None:

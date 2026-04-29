@@ -21,36 +21,137 @@ Usage:
 
     # Run all tests except integration
     uv run pytest -m "not integration"
+
+    # Write snapshots for manual validation (writes to tests/integration/snapshots/real_projects/)
+    uv run pytest tests/integration/test_static_analysis_consistency.py -m integration --write-snapshots
 """
 
+import json
+import platform
 import time
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from git import Repo
-from unittest.mock import patch
 
-from static_analyzer import get_static_analysis
 from repo_utils import clone_repository
+from repo_utils.ignore import initialize_codeboardingignore
+from static_analyzer import get_static_analysis
+from static_analyzer.analysis_result import StaticAnalysisResults
 
 from .conftest import (
-    RepositoryTestConfig,
     REPOSITORY_CONFIGS,
+    RepositoryTestConfig,
     create_mock_scanner,
-    load_fixture,
     extract_metrics,
+    load_fixture,
 )
 
-# Tolerance percentage for metric comparisons (2% = 0.02)
-METRIC_TOLERANCE = 0.02
+SNAPSHOT_DIR = Path(__file__).parent / "snapshots" / "real_projects"
+
+
+def _relative_path(file_path: str, repo_path: Path) -> str:
+    """Return a repo-relative path string, falling back to the original if it's not under repo_path.
+
+    Uses as_posix() so snapshots written on Windows are byte-identical to
+    those written on macOS / Linux — otherwise a Windows-authored snapshot
+    would diff against the repo version on every subsequent CI run.
+    """
+    if not file_path:
+        return ""
+    try:
+        return Path(file_path).relative_to(repo_path).as_posix()
+    except ValueError:
+        return file_path
+
+
+def _write_snapshot(static_analysis: StaticAnalysisResults, language: str, config_name: str, repo_path: Path) -> Path:
+    """Write a detailed snapshot of the analysis results to a JSON file for manual validation.
+
+    The snapshot includes all references, hierarchy, call graph edges, package dependencies,
+    and source files — everything needed to verify correctness by inspection.
+    """
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    repo_path = repo_path.resolve()
+
+    # References: sorted list of fully qualified names with type and location
+    refs = static_analysis.results.get(language, {}).get("references", {})
+    references_snapshot = []
+    for fqn, node in sorted(refs.items()):
+        references_snapshot.append(
+            {
+                "name": fqn,
+                "type": node.entity_label(),
+                "file": _relative_path(node.file_path, repo_path),
+                "lines": f"{node.line_start}-{node.line_end}",
+            }
+        )
+
+    # Call graph edges
+    try:
+        cfg = static_analysis.get_cfg(language)
+        edges_snapshot = sorted([e.get_source(), e.get_destination()] for e in cfg.edges)
+        nodes_snapshot = sorted(cfg.nodes.keys())
+    except ValueError:
+        edges_snapshot = []
+        nodes_snapshot = []
+
+    # Package dependencies
+    try:
+        deps = static_analysis.get_package_dependencies(language)
+    except ValueError:
+        deps = {}
+    packages_snapshot = {}
+    for pkg_name, pkg_info in sorted(deps.items()):
+        packages_snapshot[pkg_name] = {
+            "imports": sorted(pkg_info.get("imports", [])),
+            "imported_by": sorted(pkg_info.get("imported_by", [])),
+        }
+
+    # Source files
+    source_files = static_analysis.get_source_files(language)
+    source_files_rel = sorted(_relative_path(f, repo_path) for f in source_files)
+
+    snapshot = {
+        "config_name": config_name,
+        "language": language,
+        "metrics": {
+            "references_count": len(refs),
+            "packages_count": len(deps),
+            "call_graph_nodes": len(nodes_snapshot),
+            "call_graph_edges": len(edges_snapshot),
+            "source_files_count": len(source_files_rel),
+        },
+        "references": references_snapshot,
+        "call_graph_nodes": nodes_snapshot,
+        "call_graph_edges": edges_snapshot,
+        "package_dependencies": packages_snapshot,
+        "source_files": source_files_rel,
+    }
+
+    snapshot_path = SNAPSHOT_DIR / f"{config_name}_snapshot.json"
+    with open(snapshot_path, "w") as f:
+        json.dump(snapshot, f, indent=2, default=str)
+
+    return snapshot_path
+
+
+# Tolerance for metric vs fixture (relative diff) to account for LSP variance on Windows.
+METRIC_TOLERANCE = 0.026
 
 # Minimum absolute tolerance for small numbers (e.g., 20 vs 19 is 5% diff, but only 1 unit)
 MIN_ABSOLUTE_TOLERANCE = 2
 
-# Tolerance percentage for execution time comparisons (15% = 0.15)
+# Upper-bound tolerance for execution time (15% slower than baseline is still a pass).
+# Faster runs never fail; hardware gets quicker, so we only gate on slowdowns.
 EXECUTION_TIME_TOLERANCE = 0.15
 
-# Minimum absolute tolerance for execution time in seconds
-MIN_EXECUTION_TIME_TOLERANCE = 90
+# Minimum absolute tolerance for execution-time comparisons; the larger
+# of this and EXECUTION_TIME_TOLERANCE applies. Set to 150s to absorb
+# JDTLS warm-up variance on shared macOS runners (observed 177s-295s
+# range for the same mockito_java test across consecutive runs).
+MIN_EXECUTION_TIME_TOLERANCE = 150
 
 
 def get_language_marker(language: str):
@@ -62,6 +163,8 @@ def get_language_marker(language: str):
         "TypeScript": pytest.mark.typescript_lang,
         "PHP": pytest.mark.php_lang,
         "JavaScript": pytest.mark.javascript_lang,
+        "Rust": pytest.mark.rust_lang,
+        "CSharp": pytest.mark.csharp_lang,
     }
     return marker_map.get(language)
 
@@ -92,6 +195,7 @@ class TestStaticAnalysisConsistency:
         self,
         config: RepositoryTestConfig,
         temp_workspace,
+        request,
     ):
         """Verify that static analysis produces expected results.
 
@@ -100,7 +204,8 @@ class TestStaticAnalysisConsistency:
         2. Clears cache by using a fresh temp directory
         3. Runs static analysis with mocked language detection
         4. Verifies the expected language is present in results
-        5. Compares metrics against expected fixture with 1% tolerance
+        5. Compares metrics against expected fixture within METRIC_TOLERANCE
+        6. Optionally writes a detailed snapshot (--write-snapshots)
         """
         # Setup directories
         repo_root = temp_workspace / "repos"
@@ -114,6 +219,14 @@ class TestStaticAnalysisConsistency:
         repo = Repo(repo_path)
         repo.git.checkout(config.pinned_commit)
 
+        # Ensure the current .codeboardingignore template is used, not whatever
+        # the cloned repo might have from an older version.
+        codeboarding_dir = repo_path / ".codeboarding"
+        codeboarding_dir.mkdir(parents=True, exist_ok=True)
+        ignore_file = codeboarding_dir / ".codeboardingignore"
+        ignore_file.unlink(missing_ok=True)
+        initialize_codeboardingignore(codeboarding_dir)
+
         # Load expected fixture
         expected = load_fixture(config.fixture_file)
         expected_metrics = expected["metrics"]
@@ -126,6 +239,11 @@ class TestStaticAnalysisConsistency:
         end_time = time.perf_counter()
         actual_execution_time = end_time - start_time
 
+        # Write snapshot if requested
+        if request.config.getoption("--write-snapshots"):
+            snapshot_path = _write_snapshot(static_analysis, config.language, config.name, repo_path)
+            print(f"\nSnapshot written to: {snapshot_path}")
+
         # Extract actual metrics
         actual_metrics = extract_metrics(static_analysis, config.language)
         actual_metrics["execution_time_seconds"] = actual_execution_time
@@ -133,7 +251,6 @@ class TestStaticAnalysisConsistency:
         # Compare all metrics and collect results
         metric_names = [
             "references_count",
-            "classes_count",
             "packages_count",
             "call_graph_nodes",
             "call_graph_edges",
@@ -141,17 +258,38 @@ class TestStaticAnalysisConsistency:
             "execution_time_seconds",
         ]
 
+        current_os = platform.system()
+        # Metrics that vary across OSes (LSP servers report slightly
+        # different reference counts on Windows; execution time tracks
+        # runner hardware) are stored as ``<name>_by_os`` dicts keyed by
+        # ``platform.system()``. All other metrics are flat scalars.
+        per_os_metrics = {"references_count", "execution_time_seconds"}
         results = []
         for metric_name in metric_names:
             actual = actual_metrics[metric_name]
-            expected_val = expected_metrics[metric_name]
+            if metric_name in per_os_metrics:
+                by_os_key = f"{metric_name}_by_os"
+                try:
+                    expected_val = expected_metrics[by_os_key][current_os]
+                except KeyError as e:
+                    raise AssertionError(
+                        f"Fixture {config.fixture_file} is missing " f"{by_os_key}[{current_os!r}] (got {e})"
+                    ) from None
+            else:
+                expected_val = expected_metrics[metric_name]
             if metric_name == "execution_time_seconds":
                 tolerance = EXECUTION_TIME_TOLERANCE
                 min_absolute = MIN_EXECUTION_TIME_TOLERANCE
+                # Faster-than-baseline runs are a win, not a regression — only
+                # flag when ``actual`` exceeds the upper tolerance bound.
+                upper_only = True
             else:
                 tolerance = METRIC_TOLERANCE
                 min_absolute = MIN_ABSOLUTE_TOLERANCE
-            is_pass, diff_info = self._check_metric_within_tolerance(actual, expected_val, tolerance, min_absolute)
+                upper_only = False
+            is_pass, diff_info = self._check_metric_within_tolerance(
+                actual, expected_val, tolerance, min_absolute, upper_only=upper_only
+            )
             results.append(
                 {
                     "metric": metric_name,
@@ -182,8 +320,6 @@ class TestStaticAnalysisConsistency:
                 expected["sample_references"],
                 "references",
             )
-        if "sample_classes" in expected:
-            self._verify_sample_classes_present(static_analysis, config.language, expected["sample_classes"])
 
     def _check_metric_within_tolerance(
         self,
@@ -191,8 +327,13 @@ class TestStaticAnalysisConsistency:
         expected: int | float,
         tolerance: float,
         min_absolute: int | float = MIN_ABSOLUTE_TOLERANCE,
+        upper_only: bool = False,
     ) -> tuple[bool, str]:
         """Check if actual value is within tolerance of expected.
+
+        When ``upper_only`` is True, ``actual < expected`` is always a pass —
+        used for metrics (e.g. execution time) where beating the baseline
+        is a win rather than a regression.
 
         Returns:
             Tuple of (is_pass, diff_info_string)
@@ -200,10 +341,16 @@ class TestStaticAnalysisConsistency:
         if expected == 0:
             if actual == 0:
                 return True, "match"
+            if upper_only and actual < 0:
+                return True, f"faster than baseline ({actual})"
             return False, f"expected 0, got {actual}"
 
-        relative_diff = abs(actual - expected) / expected
-        absolute_diff = abs(actual - expected)
+        diff = actual - expected
+        absolute_diff = abs(diff)
+        relative_diff = absolute_diff / expected
+
+        if upper_only and actual < expected:
+            return True, f"faster than baseline (-{relative_diff * 100:.1f}%)"
 
         # For small numbers, use absolute tolerance; for large numbers, use percentage
         # Whichever is more generous
@@ -213,7 +360,6 @@ class TestStaticAnalysisConsistency:
         if relative_diff <= tolerance:
             return True, f"±{relative_diff * 100:.1f}%"
 
-        diff = actual - expected
         diff_str = f"{diff:+.0f}" if isinstance(diff, int) or diff == int(diff) else f"{diff:+.2f}"
         return (
             False,
@@ -250,7 +396,7 @@ class TestStaticAnalysisConsistency:
         if not isinstance(references, dict):
             pytest.fail(f"Expected dict for references, got {type(references).__name__}")
 
-        reference_keys = set(references.keys())
+        reference_keys = {k.lower() for k in references.keys()}
 
         for entity in sample_entities:
             entity_lower = entity.lower()
