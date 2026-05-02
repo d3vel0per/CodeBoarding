@@ -22,7 +22,6 @@ from agents.validation import (
     validate_cluster_coverage,
     validate_group_name_coverage,
     validate_key_entities,
-    validate_qualified_names,
     validate_relation_component_names,
 )
 from monitoring import trace
@@ -71,8 +70,20 @@ class AbstractionAgent(ClusterMethodsMixin, CodeBoardingAgent):
 
         programming_langs = self.static_analysis.get_languages()
 
-        # Build cluster string using the pre-computed cluster results
-        cluster_str = self._build_cluster_string(programming_langs, cluster_results)
+        # Measure everything that wraps cfg_clusters (system message + rendered
+        # template with an empty slot) so the skip planner can back it out of
+        # the input window before budgeting the cluster string.
+        overhead_chars = len(str(self.system_message.content)) + len(
+            self.prompts["group_clusters"].format(
+                project_name=self.project_name,
+                cfg_clusters="",
+                meta_context=meta_context_str,
+                project_type=project_type,
+            )
+        )
+        cluster_str = self._build_cluster_string(
+            programming_langs, cluster_results, prompt_overhead_chars=overhead_chars
+        )
 
         prompt = self.prompts["group_clusters"].format(
             project_name=self.project_name,
@@ -89,7 +100,7 @@ class AbstractionAgent(ClusterMethodsMixin, CodeBoardingAgent):
                 cluster_results=cluster_results,
                 expected_cluster_ids=get_all_cluster_ids(cluster_results),
             ),
-            max_validation_retries=3,
+            max_validation_attempts=3,
         )
         return cluster_analysis
 
@@ -104,12 +115,20 @@ class AbstractionAgent(ClusterMethodsMixin, CodeBoardingAgent):
 
         cluster_str = llm_cluster_analysis.llm_str() if llm_cluster_analysis else "No cluster analysis available."
 
+        group_names = [cc.name for cc in llm_cluster_analysis.cluster_components] if llm_cluster_analysis else []
+
         prompt = self.prompts["final_analysis"].format(
             project_name=self.project_name,
             cluster_analysis=cluster_str,
             meta_context=meta_context_str,
             project_type=project_type,
         )
+
+        if group_names:
+            prompt += (
+                f"\n\n## All Group Names ({len(group_names)} total)\n"
+                f"Every one of these names must appear in exactly one component's source_group_names: {group_names}\n"
+            )
 
         # Build validation context with CFG graphs for edge checking
         context = ValidationContext(
@@ -126,10 +145,9 @@ class AbstractionAgent(ClusterMethodsMixin, CodeBoardingAgent):
                 validate_relation_component_names,
                 validate_group_name_coverage,
                 validate_key_entities,
-                validate_qualified_names,
             ],
             context=context,
-            max_validation_retries=3,
+            max_validation_attempts=3,
         )
 
     def run(self):
@@ -154,9 +172,6 @@ class AbstractionAgent(ClusterMethodsMixin, CodeBoardingAgent):
         # Step 7: Fix source code reference lines (resolves reference_file paths for key_entities)
         analysis = self.fix_source_code_reference_lines(analysis)
         # Step 8: Ensure unique key entities across components
-        self._ensure_unique_key_entities(analysis)
-
-        return analysis, cluster_results
         self._ensure_unique_key_entities(analysis)
 
         return analysis, cluster_results

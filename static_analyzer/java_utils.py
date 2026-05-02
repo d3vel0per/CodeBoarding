@@ -96,9 +96,26 @@ def find_java_21_or_later() -> Path | None:
     """
     Find a Java 21+ installation.
 
+    Checks JAVA_HOME first, then system installations, and finally the
+    system PATH as a fallback.
+
     Returns:
         Path to JDK home, or None if not found
     """
+    java_suffix = "java.exe" if platform.system() == "Windows" else "java"
+
+    # 1. Check JAVA_HOME environment variable
+    java_home_env = os.environ.get("JAVA_HOME")
+    if java_home_env:
+        java_home_path = Path(java_home_env)
+        java_home_java = java_home_path / "bin" / java_suffix
+        if java_home_java.exists():
+            version = get_java_version(str(java_home_java))
+            if version >= 21:
+                logger.info(f"Using JAVA_HOME Java {version} at {java_home_path}")
+                return java_home_path
+
+    # 2. Check system JDK installations
     jdks = detect_java_installations()
 
     for jdk in jdks:
@@ -108,7 +125,7 @@ def find_java_21_or_later() -> Path | None:
             logger.info(f"Found Java {version} at {jdk}")
             return jdk
 
-    # Check system java as fallback
+    # 3. Check system java as fallback
     if get_java_version("java") >= 21:
         java_path = shutil.which("java")
         if java_path:

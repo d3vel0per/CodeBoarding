@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -9,9 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from agents.abstraction_agent import AbstractionAgent
-from agents.agent_responses import AnalysisInsights, Component
+from agents.agent_responses import AnalysisInsights, Component, MethodEntry
 from agents.details_agent import DetailsAgent
-from agents.llm_config import initialize_llms
+from agents.llm_config import MONITORING_CALLBACK, initialize_llms
 from agents.meta_agent import MetaAgent
 from agents.planner_agent import get_expandable_components
 from diagram_analysis.analysis_json import (
@@ -20,20 +21,23 @@ from diagram_analysis.analysis_json import (
     NotAnalyzedFile,
 )
 from diagram_analysis.file_coverage import FileCoverage
-from diagram_analysis.incremental import IncrementalUpdater, UpdateAction
-from diagram_analysis.incremental.io_utils import save_analysis
-from diagram_analysis.manifest import (
-    build_manifest_from_analysis,
-    manifest_exists,
-    save_manifest,
+from diagram_analysis.incremental_tracer import run_trace
+from diagram_analysis.incremental_updater import IncrementalUpdater, apply_method_delta
+from diagram_analysis.io_utils import save_analysis
+from diagram_analysis.scope_planner import (
+    apply_patch_scopes,
+    build_ownership_index,
+    derive_patch_scopes,
+    normalize_changes_for_delta,
+    pick_component_for_file,
 )
 from diagram_analysis.version import Version
 from health.config import initialize_health_dir, load_health_config
 from health.runner import run_health_checks
 from monitoring import StreamingStatsWriter
 from monitoring.mixin import MonitoringMixin
-from monitoring.paths import generate_run_id, get_monitoring_run_dir
-from repo_utils import get_git_commit_hash, get_repo_state_hash
+from monitoring.paths import get_monitoring_run_dir
+from repo_utils import get_git_commit_hash
 from repo_utils.ignore import RepoIgnoreManager
 from static_analyzer import StaticAnalyzer, get_static_analysis
 from static_analyzer.analysis_result import StaticAnalysisResults
@@ -51,8 +55,9 @@ class DiagramGenerator:
         repo_name: str,
         output_dir: Path,
         depth_level: int,
+        run_id: str,
+        log_path: str,
         project_name: str | None = None,
-        run_id: str | None = None,
         monitoring_enabled: bool = False,
         static_analyzer: StaticAnalyzer | None = None,
     ):
@@ -63,11 +68,9 @@ class DiagramGenerator:
         self.depth_level = depth_level
         self.project_name = project_name
         self.run_id = run_id
+        self.log_path = log_path
         self.monitoring_enabled = monitoring_enabled
         self.force_full_analysis = False  # Set to True to skip incremental updates
-        # Optional pre-started StaticAnalyzer injected by long-lived callers (e.g. the
-        # wrapper). When set, pre_analysis() uses it directly instead of creating a new
-        # one-shot analyzer via get_static_analysis().
         self._static_analyzer = static_analyzer
 
         self.details_agent: DetailsAgent | None = None
@@ -149,9 +152,12 @@ class DiagramGenerator:
             f.write(report.model_dump_json(indent=2, exclude_none=True))
         logger.info(f"File coverage report written to {coverage_path}")
 
-    def _get_static_from_injected_analyzer(self, cache_dir: Path | None) -> StaticAnalysisResults:
+    def _get_static_from_injected_analyzer(
+        self, cache_dir: Path | None, skip_cache: bool = False
+    ) -> StaticAnalysisResults:
         result = self._static_analyzer.analyze(  # type: ignore[union-attr]
             cache_dir=cache_dir,
+            skip_cache=skip_cache,
         )
         result.diagnostics = self._static_analyzer.collected_diagnostics  # type: ignore[union-attr]
         return result
@@ -167,12 +173,13 @@ class DiagramGenerator:
             project_name=self.repo_name,
             agent_llm=agent_llm,
             parsing_llm=parsing_llm,
+            run_id=self.run_id,
         )
         self._monitoring_agents["MetaAgent"] = self.meta_agent
 
         def get_static_with_injected_analyzer() -> StaticAnalysisResults:
             cache_dir = None if self.force_full_analysis else get_cache_dir(self.repo_location)
-            return self._get_static_from_injected_analyzer(cache_dir)
+            return self._get_static_from_injected_analyzer(cache_dir, skip_cache=True)
 
         def get_static_with_new_analyzer() -> StaticAnalysisResults:
             skip_cache = self.force_full_analysis
@@ -189,8 +196,10 @@ class DiagramGenerator:
             static_callable = get_static_with_new_analyzer
 
         with ThreadPoolExecutor(max_workers=2) as executor:
+            meta_agent = self.meta_agent
+            assert meta_agent is not None
             static_future = executor.submit(static_callable)
-            meta_future = executor.submit(self.meta_agent.get_meta_context, refresh=self.force_full_analysis)
+            meta_future = executor.submit(meta_agent.analyze_project_metadata, skip_cache=self.force_full_analysis)
             static_analysis = static_future.result()
             meta_context = meta_future.result()
 
@@ -219,6 +228,7 @@ class DiagramGenerator:
             meta_context=meta_context,
             agent_llm=agent_llm,
             parsing_llm=parsing_llm,
+            run_id=self.run_id,
         )
         self._monitoring_agents["DetailsAgent"] = self.details_agent
         self.abstraction_agent = AbstractionAgent(
@@ -241,14 +251,7 @@ class DiagramGenerator:
             )
 
         if self.monitoring_enabled:
-            # Create run directory using unified path utilities
-            if self.run_id:
-                run_id = self.run_id
-            else:
-                run_name = self.project_name or self.repo_name
-                run_id = generate_run_id(name=run_name)
-
-            monitoring_dir = get_monitoring_run_dir(run_id, create=True)
+            monitoring_dir = get_monitoring_run_dir(self.log_path, create=True)
             logger.debug(f"Monitoring enabled. Writing stats to {monitoring_dir}")
 
             # Save code_stats.json
@@ -276,6 +279,7 @@ class DiagramGenerator:
 
         expanded_components: list[Component] = []
         sub_analyses: dict[str, AnalysisInsights] = {}
+        commit_hash = get_git_commit_hash(self.repo_location)
 
         # Group stats to avoid cluttering the local variable scope
         stats = {"submitted": 0, "completed": 0, "saves": 0, "errors": 0}
@@ -320,6 +324,7 @@ class DiagramGenerator:
                                 output_dir=Path(self.output_dir),
                                 sub_analyses=sub_analyses,
                                 repo_name=self.repo_name,
+                                commit_hash=commit_hash,
                             )
 
                         if new_components and level + 1 < self.depth_level:
@@ -369,24 +374,13 @@ class DiagramGenerator:
             # Process components using a frontier queue: submit children as soon as parent finishes.
             expanded_components, sub_analyses = self._generate_subcomponents(analysis, root_components)
 
-            # Build file coverage summary for metadata
-            file_coverage_summary = None
-            if self.file_coverage_data:
-                s = self.file_coverage_data["summary"]
-                file_coverage_summary = FileCoverageSummary(
-                    total_files=s["total_files"],
-                    analyzed=s["analyzed"],
-                    not_analyzed=s["not_analyzed"],
-                    not_analyzed_by_reason=s["not_analyzed_by_reason"],
-                )
-
-            # Final write of unified analysis.json
             analysis_path = save_analysis(
                 analysis=analysis,
                 output_dir=Path(self.output_dir),
                 sub_analyses=sub_analyses,
                 repo_name=self.repo_name,
-                file_coverage_summary=file_coverage_summary,
+                file_coverage_summary=self._build_file_coverage_summary(),
+                commit_hash=get_git_commit_hash(self.repo_location),
             ).resolve()
 
             logger.info(f"Analysis complete. Written unified analysis to {analysis_path}")
@@ -394,120 +388,130 @@ class DiagramGenerator:
             # Write file_coverage.json
             self._write_file_coverage()
 
-            # Save manifest for incremental updates
-            self._save_manifest(analysis, expanded_components)
-
             return analysis_path
 
-    def _save_manifest(self, analysis: AnalysisInsights, expanded_components: list) -> None:
-        """Save the analysis manifest for incremental updates."""
-        try:
-            repo_state_hash = get_repo_state_hash(self.repo_location)
-            base_commit = get_git_commit_hash(self.repo_location)
+    def _normalize_repo_path(self, path: str) -> str:
+        posix = path.replace("\\", "/")
+        if Path(posix).is_absolute():
+            try:
+                return Path(posix).resolve().relative_to(self.repo_location.resolve()).as_posix()
+            except ValueError:
+                return posix
+        while posix.startswith("./"):
+            posix = posix[2:]
+        return posix
 
-            expanded_names = [c.component_id for c in expanded_components]
+    def _collect_method_entries_from_static_analysis(self) -> dict[str, list]:
+        assert self.static_analysis is not None
+        methods_by_file: dict[str, list[MethodEntry]] = defaultdict(list)
 
-            manifest = build_manifest_from_analysis(
-                analysis=analysis,
-                repo_state_hash=repo_state_hash,
-                base_commit=base_commit,
-                expanded_components=expanded_names,
-            )
+        for language in self.static_analysis.get_languages():
+            try:
+                cfg = self.static_analysis.get_cfg(language)
+            except ValueError:
+                continue
 
-            save_manifest(manifest, self.output_dir)
-            logger.info(f"Saved manifest with {len(manifest.file_to_component)} file mappings")
-        except Exception as e:
-            logger.warning(f"Failed to save manifest: {e}")
+            for node in cfg.nodes.values():
+                if node.is_callback_or_anonymous():
+                    continue
+                if not (node.is_callable() or node.is_class()):
+                    continue
+                file_path = self._normalize_repo_path(node.file_path)
 
-    def try_incremental_update(self) -> Path | None:
-        """
-        Attempt an incremental update if possible.
+                methods_by_file[file_path].append(
+                    MethodEntry(
+                        qualified_name=node.fully_qualified_name,
+                        start_line=node.line_start,
+                        end_line=node.line_end,
+                        node_type=node.type.name,
+                    )
+                )
 
-        Returns:
-            Path to the analysis output if incremental update succeeded,
-            None if full analysis is needed.
-        """
-        if self.force_full_analysis:
-            logger.info("Force full analysis requested, skipping incremental check")
+        for file_path, methods in methods_by_file.items():
+            methods.sort(key=lambda method: (method.start_line, method.end_line, method.qualified_name))
+            methods_by_file[file_path] = methods
+
+        return methods_by_file
+
+    def _build_file_coverage_summary(self) -> FileCoverageSummary | None:
+        if not self.file_coverage_data:
             return None
-
-        if not manifest_exists(self.output_dir):
-            logger.info("No existing manifest, full analysis required")
-            return None
-
-        # For UPDATE_COMPONENTS action, we need static analysis to properly
-        # recompute file assignments with cluster matching. Load it first.
-        static_analysis = None
-        try:
-            if self._static_analyzer is not None:
-                static_analysis = self._static_analyzer.analyze(cache_dir=get_cache_dir(self.repo_location))
-                static_analysis.diagnostics = self._static_analyzer.collected_diagnostics
-            else:
-                static_analysis = get_static_analysis(self.repo_location)
-            logger.info("Loaded static analysis for incremental update")
-        except Exception as e:
-            logger.warning(f"Could not load static analysis: {e}")
-
-        # Always regenerate the health report when static analysis is available
-        if static_analysis:
-            self._run_health_report(static_analysis)
-
-        updater = IncrementalUpdater(
-            repo_dir=self.repo_location,
-            output_dir=self.output_dir,
-            static_analysis=static_analysis,
-            force_full=self.force_full_analysis,
+        summary = self.file_coverage_data["summary"]
+        return FileCoverageSummary(
+            total_files=summary["total_files"],
+            analyzed=summary["analyzed"],
+            not_analyzed=summary["not_analyzed"],
+            not_analyzed_by_reason=summary["not_analyzed_by_reason"],
         )
 
-        if not updater.can_run_incremental():
-            return None
+    def generate_analysis_incremental(
+        self,
+        root_analysis: AnalysisInsights,
+        sub_analyses: dict[str, AnalysisInsights],
+        base_ref: str,
+        changes,
+    ) -> Path:
+        if self.static_analysis is None:
+            self.pre_analysis()
+        assert self.static_analysis is not None
 
-        impact = updater.analyze()
+        ownership_index = build_ownership_index(root_analysis, sub_analyses)
+        added_files, modified_files, deleted_files, rename_map = normalize_changes_for_delta(changes)
+        methods_by_file = self._collect_method_entries_from_static_analysis()
 
-        # Log the impact for user visibility
-        logger.info(f"Incremental update impact: {impact.action.value}")
+        updater = IncrementalUpdater(
+            analysis=root_analysis,
+            symbol_resolver=lambda file_path: methods_by_file.get(self._normalize_repo_path(file_path), []),
+            repo_dir=self.repo_location,
+            component_resolver=lambda file_path: pick_component_for_file(file_path, ownership_index, rename_map),
+        )
+        delta = updater.compute_delta(
+            added_files=added_files,
+            modified_files=modified_files,
+            deleted_files=deleted_files,
+            changes=changes,
+        )
 
-        if impact.action == UpdateAction.NONE:
-            logger.info("No changes detected, analysis is up to date")
-            return self.output_dir / "analysis.json"
+        apply_method_delta(root_analysis, sub_analyses, delta)
+        post_delta_ownership_index = build_ownership_index(root_analysis, sub_analyses)
 
-        # For structural changes, recompute which components are actually affected
-        # after static analysis has been updated with cluster matching
-        if impact.action == UpdateAction.UPDATE_COMPONENTS and static_analysis:
-            logger.info("Recomputing affected components with updated cluster assignments...")
-            updater.recompute_dirty_components(static_analysis)
+        agent_llm, parsing_llm = initialize_llms()
+        callbacks = [MONITORING_CALLBACK]
+        cfgs = {
+            language: self.static_analysis.get_cfg(language)
+            for language in self.static_analysis.get_languages()
+            if self.static_analysis.get_source_files(language)
+        }
+        trace_result = run_trace(
+            delta,
+            cfgs,
+            self.static_analysis,
+            self.repo_location,
+            base_ref,
+            parsing_llm,
+            parsed_diff=getattr(changes, "parsed_diff", None),
+            callbacks=callbacks,
+        )
 
-        if updater.execute():
-            logger.info("Incremental update completed successfully")
+        patch_scopes = derive_patch_scopes(
+            trace_result,
+            root_analysis,
+            sub_analyses,
+            post_delta_ownership_index,
+            rename_map,
+        )
+        if patch_scopes:
+            root_analysis, sub_analyses = apply_patch_scopes(
+                root_analysis, sub_analyses, patch_scopes, agent_llm, callbacks
+            )
 
-            # Update file coverage incrementally
-            if static_analysis:
-                scanner = ProjectScanner(self.repo_location)
-                current_analyzed = {Path(f) for f in static_analysis.get_all_source_files()}
-                all_text_files = {Path(f) for f in scanner.all_text_files}
-
-                self.file_coverage_data = updater.update_file_coverage(
-                    current_analyzed_files=current_analyzed,
-                    all_text_files=all_text_files,
-                )
-                self._write_file_coverage()
-
-            return self.output_dir / "analysis.json"
-
-        # Incremental update failed or not possible
-        logger.info("Incremental update not possible, falling back to full analysis")
-        return None
-
-    def generate_analysis_smart(self) -> Path:
-        """
-        Smart analysis that tries incremental first, falls back to full.
-
-        This is the recommended entry point for analysis.
-        """
-        # Try incremental update first
-        result = self.try_incremental_update()
-        if result is not None:
-            return result
-
-        # Fall back to full analysis
-        return self.generate_analysis()
+        analysis_path = save_analysis(
+            analysis=root_analysis,
+            output_dir=Path(self.output_dir),
+            sub_analyses=sub_analyses,
+            repo_name=self.repo_name,
+            file_coverage_summary=self._build_file_coverage_summary(),
+            commit_hash=get_git_commit_hash(self.repo_location),
+        ).resolve()
+        self._write_file_coverage()
+        return analysis_path

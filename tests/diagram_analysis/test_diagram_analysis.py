@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -10,11 +11,13 @@ from agents.agent_responses import (
     AnalysisInsights,
     Component,
     FileMethodGroup,
+    MethodEntry,
     Relation,
     SourceCodeReference,
     assign_component_ids,
 )
 from diagram_analysis.analysis_json import (
+    ComponentFileMethodGroupJson,
     ComponentJson,
     RelationJson,
     UnifiedAnalysisJson,
@@ -23,6 +26,7 @@ from diagram_analysis.analysis_json import (
 )
 from diagram_analysis.diagram_generator import DiagramGenerator
 from diagram_analysis.version import Version
+from repo_utils.change_detector import ChangeSet
 from static_analyzer.analysis_result import StaticAnalysisResults
 
 
@@ -61,8 +65,8 @@ class TestComponentJson(unittest.TestCase):
             description="Test description",
             can_expand=True,
             file_methods=[
-                FileMethodGroup(file_path="file1.py"),
-                FileMethodGroup(file_path="file2.py"),
+                ComponentFileMethodGroupJson(file_path="file1.py", methods=[]),
+                ComponentFileMethodGroupJson(file_path="file2.py", methods=[]),
             ],
             key_entities=[],
         )
@@ -313,8 +317,6 @@ class TestDiagramGenerator(unittest.TestCase):
 
     def tearDown(self):
         # Clean up temporary directory
-        import shutil
-
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_init(self):
@@ -325,6 +327,8 @@ class TestDiagramGenerator(unittest.TestCase):
             repo_name="test_repo",
             output_dir=self.output_dir,
             depth_level=2,
+            run_id="test-run-id",
+            log_path="test_repo/test-run-log",
         )
 
         self.assertEqual(gen.repo_location, self.repo_location)
@@ -388,6 +392,8 @@ class TestDiagramGenerator(unittest.TestCase):
             repo_name="test_repo",
             output_dir=self.output_dir,
             depth_level=2,
+            run_id="test-run-id",
+            log_path="test_repo/test-run-log",
         )
 
         gen.pre_analysis()
@@ -396,6 +402,7 @@ class TestDiagramGenerator(unittest.TestCase):
         self.assertIsNotNone(gen.meta_agent)
         self.assertIsNotNone(gen.details_agent)
         self.assertIsNotNone(gen.abstraction_agent)
+        mock_meta_instance.analyze_project_metadata.assert_called_once_with(skip_cache=False)
         # Note: planner is now a module function, not an agent instance
 
         # Verify version file was created
@@ -411,6 +418,8 @@ class TestDiagramGenerator(unittest.TestCase):
             repo_name="test_repo",
             output_dir=self.output_dir,
             depth_level=2,
+            run_id="test-run-id",
+            log_path="test_repo/test-run-log",
         )
 
         # Setup agents
@@ -440,6 +449,8 @@ class TestDiagramGenerator(unittest.TestCase):
             repo_name="test_repo",
             output_dir=self.output_dir,
             depth_level=3,
+            run_id="test-run-id",
+            log_path="test_repo/test-run-log",
         )
 
         root_a = Component(
@@ -472,7 +483,6 @@ class TestDiagramGenerator(unittest.TestCase):
         gen.abstraction_agent = Mock()
         gen.abstraction_agent.run.return_value = (root_analysis, {})
         gen.details_agent = Mock()  # pre_analysis is skipped when details/abstraction are already initialized
-        gen._save_manifest = Mock()
         mock_get_expandable_components.return_value = [root_a, root_b]
         mock_save_analysis.return_value = self.output_dir / "analysis.json"
 
@@ -513,24 +523,45 @@ class TestDiagramGenerator(unittest.TestCase):
             repo_name="test_repo",
             output_dir=self.output_dir,
             depth_level=1,
+            run_id="test-run-id",
+            log_path="test_repo/test-run-log",
         )
 
-        # Prevent pre_analysis from running and avoid manifest writes.
+        # Prevent pre_analysis from running.
         gen.abstraction_agent = Mock()
         gen.details_agent = Mock()
-        gen._save_manifest = Mock()
 
         comp1 = Component(
             name="Component1",
             description="First",
             key_entities=[],
-            file_methods=[FileMethodGroup(file_path="file1.py", methods=[])],
+            file_methods=[
+                FileMethodGroup(
+                    file_path="file1.py",
+                    methods=[
+                        MethodEntry(qualified_name="Component1.method1", start_line=1, end_line=10, node_type="METHOD"),
+                        MethodEntry(
+                            qualified_name="Component1.method2", start_line=11, end_line=20, node_type="METHOD"
+                        ),
+                    ],
+                )
+            ],
         )
         comp2 = Component(
             name="Component2",
             description="Second",
             key_entities=[],
-            file_methods=[FileMethodGroup(file_path="file2.py", methods=[])],
+            file_methods=[
+                FileMethodGroup(
+                    file_path="file2.py",
+                    methods=[
+                        MethodEntry(qualified_name="Component2.method1", start_line=1, end_line=10, node_type="METHOD"),
+                        MethodEntry(
+                            qualified_name="Component2.method2", start_line=11, end_line=20, node_type="METHOD"
+                        ),
+                    ],
+                )
+            ],
         )
         analysis = AnalysisInsights(
             description="Test analysis",
@@ -551,13 +582,14 @@ class TestDiagramGenerator(unittest.TestCase):
             repo_name,
             sub_analyses,
             file_coverage_summary=None,
+            commit_hash="",
         ):
             captured["expandable_components"] = expandable_components
             return "{}"
 
         with patch("diagram_analysis.diagram_generator.get_expandable_components", return_value=planned):
             with patch(
-                "diagram_analysis.incremental.io_utils.build_unified_analysis_json",
+                "diagram_analysis.io_utils.build_unified_analysis_json",
                 side_effect=_capture_build,
             ):
                 gen.generate_analysis()
@@ -574,13 +606,29 @@ class TestDiagramGenerator(unittest.TestCase):
             name="Comp1",
             description="Component one",
             key_entities=[],
-            file_methods=[FileMethodGroup(file_path="a.py", methods=[])],
+            file_methods=[
+                FileMethodGroup(
+                    file_path="a.py",
+                    methods=[
+                        MethodEntry(qualified_name="Comp1.method1", start_line=1, end_line=10, node_type="METHOD"),
+                        MethodEntry(qualified_name="Comp1.method2", start_line=11, end_line=20, node_type="METHOD"),
+                    ],
+                )
+            ],
         )
         comp2 = Component(
             name="Comp2",
             description="Component two",
             key_entities=[],
-            file_methods=[FileMethodGroup(file_path="b.py", methods=[])],
+            file_methods=[
+                FileMethodGroup(
+                    file_path="b.py",
+                    methods=[
+                        MethodEntry(qualified_name="Comp2.method1", start_line=1, end_line=10, node_type="METHOD"),
+                        MethodEntry(qualified_name="Comp2.method2", start_line=11, end_line=20, node_type="METHOD"),
+                    ],
+                )
+            ],
         )
         analysis = AnalysisInsights(
             description="Root analysis",
@@ -597,6 +645,8 @@ class TestDiagramGenerator(unittest.TestCase):
             repo_name="test_repo",
             output_dir=self.output_dir,
             depth_level=1,
+            run_id="test-run-id",
+            log_path="test_repo/test-run-log",
         )
         gen.details_agent = Mock()
         gen.abstraction_agent = Mock()
